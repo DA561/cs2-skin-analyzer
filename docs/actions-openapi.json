@@ -1,0 +1,273 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "CS2 Objective Market Analysis",
+    "version": "0.2.0",
+    "description": "Screenshot recognition happens in ChatGPT; send all visible rows without guessing. Missing market data never receives a total score."
+  },
+  "servers": [
+    {
+      "url": "https://cs2-skin-api-production.up.railway.app"
+    }
+  ],
+  "security": [
+    {
+      "AnalyzerKey": []
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "AnalyzerKey": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "Item": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "maxLength": 240,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "market_hash_name": {
+            "anyOf": [
+              {
+                "maxLength": 240,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Market Hash Name"
+          },
+          "wear": {
+            "anyOf": [
+              {
+                "maxLength": 50,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Wear"
+          },
+          "version": {
+            "default": "unknown",
+            "enum": [
+              "normal",
+              "stattrak",
+              "souvenir",
+              "unknown"
+            ],
+            "title": "Version",
+            "type": "string"
+          },
+          "pattern": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Pattern"
+          },
+          "rank": {
+            "anyOf": [
+              {
+                "maximum": 1000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Rank"
+          },
+          "screenshot_price": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Screenshot Price"
+          },
+          "confidence": {
+            "default": 1,
+            "maximum": 1,
+            "minimum": 0,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "needs_review": {
+            "default": false,
+            "title": "Needs Review",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "Item",
+        "type": "object"
+      },
+      "ItemsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Item"
+            },
+            "maxItems": 30,
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          },
+          "expected_count": {
+            "default": 30,
+            "maximum": 30,
+            "minimum": 1,
+            "title": "Expected Count",
+            "type": "integer"
+          },
+          "origin": {
+            "default": "item_list",
+            "enum": [
+              "item_list",
+              "chatgpt_vision",
+              "api_vision"
+            ],
+            "title": "Origin",
+            "type": "string"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "ItemsRequest",
+        "type": "object"
+      }
+    }
+  },
+  "paths": {
+    "/api/analyze/items": {
+      "post": {
+        "operationId": "analyzeItems",
+        "summary": "Analyze all screenshot items using actual market data",
+        "description": "Use ChatGPT vision to extract ALL visible rows including full wear and finish. Set unknown version or needs_review for uncertainty. expected_count=30 for a target leaderboard even if only some rows are visible. Never invent invisible items. Returns job_id; fetch job status later.",
+        "x-openai-isConsequential": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ItemsRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Authenticated structured JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/{job_id}": {
+      "get": {
+        "operationId": "getAnalysisJob",
+        "summary": "Fetch job status and complete structured report",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authenticated structured JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/analyze/top30": {
+      "get": {
+        "operationId": "analyzeTargetTop30",
+        "summary": "Try authorized Youpin today CNY>100 GMV descending top30",
+        "description": "Currently unavailable pending official authorization; HTTP 503 means unavailable. Never replace with another leaderboard.",
+        "responses": {
+          "200": {
+            "description": "Authenticated structured JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Official target leaderboard authorization required"
+          }
+        }
+      }
+    },
+    "/api/capabilities": {
+      "get": {
+        "operationId": "getAnalyzerCapabilities",
+        "summary": "Check configured capabilities (does not verify live authorization)",
+        "responses": {
+          "200": {
+            "description": "Authenticated structured JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

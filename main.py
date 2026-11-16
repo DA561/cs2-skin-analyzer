@@ -1,16 +1,64 @@
+import asyncio
 import os
-import time
-import threading
-from typing import Any
+from contextlib import asynccontextmanager, suppress
 
-import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="CS2 Skin Analyzer", version="0.1.0")
-BASE_URL = "https://api.csqaq.com/api/v1"
-_lock = threading.Lock()
-_last_request = 0.0
+from analyzer.jobs import Jobs
+from analyzer.models import ItemsRequest
+from analyzer.providers import CSQAQ, SourceError, Youpin
+from analyzer.security import Guard
+from analyzer.vision import Vision, validate_image
+
+csqaq_provider = CSQAQ()
+youpin_provider = Youpin()
+vision_provider = Vision()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    if int(os.getenv("WEB_CONCURRENCY", "1")) != 1 or int(os.getenv("RAILWAY_REPLICA_COUNT", "1")) != 1:
+        raise RuntimeError("Use one worker and one replica; shared distributed limiter not configured")
+    jobs = Jobs(csqaq_provider, youpin_provider, vision_provider)
+    jobs.initialize()
+    app.state.jobs = jobs
+    task = asyncio.create_task(jobs.worker())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+app = FastAPI(title="CS2 Skin Analyzer", version="0.2.0", lifespan=lifespan)
+app.add_middleware(Guard)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, exc):
+    # Pydantic's default response can echo inputs; never echo credentials or image data.
+    return JSONResponse(
+        {"detail": "invalid_request", "fields": [{"loc": list(e["loc"]), "type": e["type"]} for e in exc.errors()]},
+        status_code=422,
+    )
+
+
+@app.exception_handler(SourceError)
+async def source_error(request, exc):
+    status = 429 if exc.code in ("csqaq_rate_limited", "job_queue_full") else 503
+    if exc.code in ("image_invalid", "image_format_or_dimensions_invalid"):
+        status = 422
+    if exc.code == "image_size_limit_8mb":
+        status = 413
+    return JSONResponse(
+        {"detail": exc.code},
+        status_code=status,
+        headers={"Retry-After": str(exc.retry_after or 60)} if status == 429 else {},
+    )
 
 
 class ScoreRequest(BaseModel):
@@ -23,115 +71,140 @@ class ScoreRequest(BaseModel):
 
 
 class UpstreamRequest(BaseModel):
-    payload: dict[str, Any] = Field(default_factory=dict)
+    payload: dict = Field(default_factory=dict)
 
 
 @app.get("/")
 def index():
-    return {"name": "CS2 Skin Analyzer", "version": "0.1.0", "docs": "/docs"}
+    return {"name": "CS2 Skin Analyzer", "version": "0.2.0", "docs": "/docs"}
 
 
 @app.get("/health")
+@app.get("/api/health")
 def health():
     return {"status": "ok"}
 
 
 @app.get("/api/status")
 def status():
-    return {"csqaq_configured": bool(os.getenv("CSQAQ_API_TOKEN")),
-            "proxy_access_configured": bool(os.getenv("ANALYZER_ACCESS_KEY"))}
+    return {
+        "csqaq_configured": bool(os.getenv("CSQAQ_API_TOKEN")),
+        "proxy_access_configured": bool(os.getenv("ANALYZER_ACCESS_KEY")),
+    }
 
 
 @app.post("/api/score")
 def score(data: ScoreRequest):
     total = round(sum(data.model_dump().values()), 1)
     tier = "优先关注" if total >= 85 else "重点关注" if total >= 75 else "观察" if total >= 65 else "暂不买入"
-    return {"score": total, "tier": tier, "components": data.model_dump(),
-            "note": "人工输入的评分，不代表实时行情或买入信号"}
+    return {
+        "score": total,
+        "tier": tier,
+        "components": data.model_dump(),
+        "note": "人工输入的旧版评分，不代表实时行情或买入信号，不参与自动报告",
+    }
 
 
+@app.get("/api/capabilities")
+def capabilities():
+    return {
+        "csqaq_token_configured": bool(os.getenv("CSQAQ_API_TOKEN")),
+        "vision_configured": bool(os.getenv("OPENAI_API_KEY") and os.getenv("VISION_MODEL")),
+        "youpin_direct": "authorization_required",
+        "target_top30": "unverified_unavailable",
+        "csqaq_yyyp_fields": "documented_not_live_verified",
+        "youpin_volume_depth_fee": "unavailable",
+        "chatgpt_connection": "requires_user_action_setup",
+        "storage": "SQLite; /tmp is ephemeral unless ANALYZER_DB_PATH points to a persistent volume",
+        "execution": "single worker, single replica; 60 authenticated requests/min; 8 pending jobs; 24h retention",
+    }
+
+
+# Existing endpoint paths retained; corrected supply to the documented GET method.
 ALLOWED = {
-    "rank": "info/get_rank_list",
-    "supply": "info/good/statistic",
-    "volume": "info/vol_data_detail",
+    "rank": ("POST", "info/get_rank_list"),
+    "supply": ("GET", "info/good/statistic"),
+    "volume": ("POST", "info/vol_data_detail"),
 }
 
 
 @app.post("/api/csqaq/{kind}")
-def csqaq(kind: str, body: UpstreamRequest, x_access_key: str | None = Header(default=None)):
+async def csqaq(kind: str, body: UpstreamRequest):
     if kind not in ALLOWED:
         raise HTTPException(404, "Unsupported endpoint")
-    access_key = os.getenv("ANALYZER_ACCESS_KEY", "")
-    if not access_key:
-        raise HTTPException(503, "Set ANALYZER_ACCESS_KEY in Railway before enabling proxy")
-    import secrets
-    if not x_access_key or not secrets.compare_digest(x_access_key, access_key):
-        raise HTTPException(401, "Invalid access key")
-    token = os.getenv("CSQAQ_API_TOKEN", "")
-    if not token:
-        raise HTTPException(503, "CSQAQ_API_TOKEN not configured")
-    # This process-level rate limit is sufficient for a single worker; multi-instance deployments
-    # must use a shared rate limiter or restrict to one instance.
-    global _last_request
-    with _lock:
-        wait = 1.1 - (time.monotonic() - _last_request)
-        if wait > 0:
-            time.sleep(wait)
-        _last_request = time.monotonic()
-        try:
-            with httpx.Client(timeout=20) as client:
-                result = client.post(f"{BASE_URL}/{ALLOWED[kind]}", json=body.payload,
-                                     headers={"ApiToken": token})
-        except httpx.TimeoutException:
-            raise HTTPException(504, "Upstream timeout")
-        except httpx.HTTPError:
-            raise HTTPException(502, "Upstream connection error")
-    if result.status_code == 429:
-        raise HTTPException(429, "Upstream rate limit")
-    if result.status_code >= 400:
-        raise HTTPException(502, f"Upstream HTTP {result.status_code}")
-    try:
-        return result.json()
-    except ValueError:
-        raise HTTPException(502, "Upstream response was not JSON")
+    method, path = ALLOWED[kind]
+    result = await csqaq_provider.request(method, path, body.payload)
+    return {k: v for k, v in result.items() if k != "_queried_at"}
+
 
 @app.get("/api/csqaq/diagnostic")
-def csqaq_diagnostic(x_access_key: str = Header(default="")):
-    import secrets
-
-    expected = os.getenv("ANALYZER_ACCESS_KEY", "")
-    if not expected:
-        raise HTTPException(
-            status_code=503,
-            detail="Access key not configured"
-        )
-
-    if not secrets.compare_digest(x_access_key, expected):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized"
-        )
-
-    token = os.getenv("CSQAQ_API_TOKEN", "")
-    if not token:
-        return {"status": "missing_token"}
-
+async def csqaq_diagnostic():
     try:
-        with httpx.Client(timeout=15) as client:
-            response = client.post(
-                f"{BASE_URL}/info/get_rank_list",
-                headers={"ApiToken": token},
-                json={}
-            )
-
+        r = await csqaq_provider.request("GET", "info/good", {"id": 7310})
+        envelope = r.get("data")
+        info = envelope.get("goods_info") if isinstance(envelope, dict) else None
+        if not isinstance(info, dict) or info.get("id") != 7310:
+            raise SourceError("csqaq_detail_schema_changed")
         return {
-            "status": "response_received",
-            "http_status": response.status_code,
-            "note": "Empty payload test; API parameters may be required"
+            "status": "validated_response",
+            "queried_at": r["_queried_at"],
+            "available_fields": [
+                k
+                for k in ("yyyp_sell_price", "yyyp_buy_price", "yyyp_sell_num", "yyyp_buy_num", "updated_at")
+                if info.get(k) is not None
+            ],
         }
+    except SourceError as e:
+        return {"status": e.code, "retry_after": e.retry_after}
 
-    except httpx.TimeoutException:
-        return {"status": "timeout"}
 
-    except httpx.HTTPError:
-        return {"status": "connection_error"}
+@app.post("/api/analyze/items", status_code=202)
+async def analyze_items(body: ItemsRequest, request: Request):
+    return request.app.state.jobs.submit(request.state.owner, request=body)
+
+
+async def image_body(request):
+    raw = await request.body()
+    validate_image(raw)
+    return raw
+
+
+@app.post("/api/recognize/image")
+async def recognize_image(request: Request, expected_count: int = 30):
+    if not 1 <= expected_count <= 30:
+        raise HTTPException(422, "expected_count must be 1..30")
+    result = await vision_provider.recognize(await image_body(request), expected_count)
+    return result.model_dump(mode="json")
+
+
+@app.post("/api/analyze/image", status_code=202)
+async def analyze_image(request: Request, expected_count: int = 30):
+    if not 1 <= expected_count <= 30:
+        raise HTTPException(422, "expected_count must be 1..30")
+    raw = await image_body(request)
+    if not os.getenv("OPENAI_API_KEY") or not os.getenv("VISION_MODEL"):
+        raise SourceError("vision_not_configured")
+    return request.app.state.jobs.submit(request.state.owner, raw=raw, expected_count=expected_count)
+
+
+@app.get("/api/jobs/{job_id}")
+async def job_status(job_id: str, request: Request):
+    if len(job_id) != 32 or any(c not in "0123456789abcdef" for c in job_id):
+        raise HTTPException(404, "Job not found")
+    result = request.app.state.jobs.get(job_id, request.state.owner)
+    if not result:
+        raise HTTPException(404, "Job not found")
+    return result
+
+
+@app.get("/api/analyze/top30")
+async def analyze_top30():
+    await youpin_provider.top30()
+
+
+@app.get("/api/actions-schema")
+def actions_schema():
+    import json
+    from pathlib import Path
+
+    return json.loads(Path("docs/actions-openapi.json").read_text())
