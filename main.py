@@ -38,6 +38,60 @@ app = FastAPI(title="CS2 Skin Analyzer", version="0.2.0", lifespan=lifespan)
 app.add_middleware(Guard)
 
 
+MCP_TOOLS = [
+    {
+        "name": "get_analyzer_capabilities",
+        "description": "Check configured CS2 market-analysis capabilities. This does not prove live upstream authorization.",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
+    },
+    {
+        "name": "analyze_items",
+        "description": "Submit all visible screenshot items for objective market analysis. Do not invent unseen rows.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["items"],
+            "properties": {
+                "items": {"type": "array", "minItems": 1, "maxItems": 30, "items": {"type": "object"}},
+                "expected_count": {"type": "integer", "minimum": 1, "maximum": 30},
+                "origin": {"type": "string", "enum": ["item_list", "chatgpt_vision"]},
+            },
+        },
+    },
+    {
+        "name": "get_analysis_job",
+        "description": "Get the status and structured report for an analysis job.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["job_id"],
+            "properties": {"job_id": {"type": "string", "minLength": 32, "maxLength": 32}},
+        },
+    },
+    {
+        "name": "analyze_authorized_top30",
+        "description": "Request the authorized Youpin CNY >100 GMV top-30 analysis. A tool error means authorization is unavailable; never substitute another leaderboard.",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
+    },
+]
+
+
+def mcp_result(value, *, is_error=False):
+    result = {"content": [{"type": "text", "text": __import__("json").dumps(value, ensure_ascii=False)}]}
+    if is_error:
+        result["isError"] = True
+    return result
+
+
+def mcp_response(request_id, *, result=None, error=None):
+    response = {"jsonrpc": "2.0", "id": request_id}
+    if error:
+        response["error"] = error
+    else:
+        response["result"] = result
+    return JSONResponse(response)
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_error(request, exc):
     # Pydantic's default response can echo inputs; never echo credentials or image data.
@@ -118,6 +172,48 @@ def capabilities():
         "storage": "SQLite; /tmp is ephemeral unless ANALYZER_DB_PATH points to a persistent volume",
         "execution": "single worker, single replica; 60 authenticated requests/min; 8 pending jobs; 24h retention",
     }
+
+
+@app.post("/mcp")
+async def mcp(request: Request):
+    try:
+        message = await request.json()
+    except ValueError:
+        return mcp_response(None, error={"code": -32700, "message": "Invalid JSON"})
+    if not isinstance(message, dict):
+        return mcp_response(None, error={"code": -32600, "message": "Invalid request"})
+    request_id = message.get("id")
+    method = message.get("method")
+    params = message.get("params") or {}
+    if method == "server/discover":
+        return mcp_response(request_id, result={"supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}})
+    if method == "tools/list":
+        return mcp_response(request_id, result={"tools": MCP_TOOLS})
+    if method != "tools/call" or not isinstance(params, dict):
+        return mcp_response(request_id, error={"code": -32601, "message": "Method not found"})
+    name = params.get("name")
+    arguments = params.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        return mcp_response(request_id, result=mcp_result({"detail": "invalid_arguments"}, is_error=True))
+    try:
+        if name == "get_analyzer_capabilities":
+            value = capabilities()
+        elif name == "analyze_items":
+            body = ItemsRequest.model_validate({**arguments, "origin": arguments.get("origin", "chatgpt_vision")})
+            value = request.app.state.jobs.submit(request.state.owner, request=body)
+        elif name == "get_analysis_job":
+            job_id = arguments.get("job_id", "")
+            value = request.app.state.jobs.get(job_id, request.state.owner)
+            if not value:
+                raise ValueError("job_not_found")
+        elif name == "analyze_authorized_top30":
+            await youpin_provider.top30()
+            value = {"status": "completed"}
+        else:
+            raise ValueError("unknown_tool")
+        return mcp_response(request_id, result=mcp_result(value))
+    except (ValueError, SourceError) as exc:
+        return mcp_response(request_id, result=mcp_result({"detail": str(exc)}, is_error=True))
 
 
 # Existing endpoint paths retained; corrected supply to the documented GET method.
