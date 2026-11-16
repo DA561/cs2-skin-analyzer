@@ -176,6 +176,24 @@ def test_actions_schema_is_valid_and_public(client):
     assert "/api/analyze/items" in schema["paths"]
 
 
+def test_mcp_is_authenticated_and_lists_tools(client):
+    assert client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status_code == 401
+    r = client.post("/mcp", headers=AUTH, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert r.status_code == 200
+    assert r.json()["result"]["tools"][0]["name"] == "get_analyzer_capabilities"
+
+
+def test_mcp_calls_capabilities_without_secret_exposure(client):
+    r = client.post(
+        "/mcp",
+        headers=AUTH,
+        json={"jsonrpc": "2.0", "id": "capabilities", "method": "tools/call", "params": {"name": "get_analyzer_capabilities"}},
+    )
+    content = r.json()["result"]["content"][0]["text"]
+    assert "csqaq_token_configured" in content
+    assert "test-only-access" not in content
+
+
 def test_old_manual_score_contract_remains(client):
     r = client.post(
         "/api/score",
