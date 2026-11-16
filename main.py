@@ -94,3 +94,44 @@ def csqaq(kind: str, body: UpstreamRequest, x_access_key: str | None = Header(de
         return result.json()
     except ValueError:
         raise HTTPException(502, "Upstream response was not JSON")
+
+@app.get("/api/csqaq/diagnostic")
+def csqaq_diagnostic(x_access_key: str = Header(default="")):
+    import secrets
+
+    expected = os.getenv("ANALYZER_ACCESS_KEY", "")
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Access key not configured"
+        )
+
+    if not secrets.compare_digest(x_access_key, expected):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    token = os.getenv("CSQAQ_API_TOKEN", "")
+    if not token:
+        return {"status": "missing_token"}
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            response = client.post(
+                f"{BASE_URL}/info/get_rank_list",
+                headers={"ApiToken": token},
+                json={}
+            )
+
+        return {
+            "status": "response_received",
+            "http_status": response.status_code,
+            "note": "Empty payload test; API parameters may be required"
+        }
+
+    except httpx.TimeoutException:
+        return {"status": "timeout"}
+
+    except httpx.HTTPError:
+        return {"status": "connection_error"}
