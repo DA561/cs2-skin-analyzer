@@ -20,7 +20,7 @@ class Guard:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         path = scope["path"]
-        protected = path.startswith("/api/") and path not in PUBLIC
+        protected = (path.startswith("/api/") and path not in PUBLIC) or path == "/mcp"
         headers = {k.lower(): v for k, v in scope["headers"]}
         if protected:
             expected = os.getenv("ANALYZER_ACCESS_KEY", "")
